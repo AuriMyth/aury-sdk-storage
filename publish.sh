@@ -80,30 +80,73 @@ check_dist() {
     echo "  - Source: $(basename "$SDIST_FILE")"
 }
 
+# 获取 Token（从环境变量、keyring 或 .pypirc）
+get_token() {
+    # 1. 优先使用环境变量
+    if [ -n "$UV_PUBLISH_TOKEN" ]; then
+        echo "$UV_PUBLISH_TOKEN"
+        return 0
+    fi
+    
+    # 2. 尝试从 keyring 读取
+    if command -v keyring &> /dev/null; then
+        TOKEN=$(keyring get pypi __token__ 2>/dev/null)
+        if [ -n "$TOKEN" ]; then
+            echo "$TOKEN"
+            return 0
+        fi
+    fi
+    
+    # 3. 尝试从 ~/.pypirc 读取
+    if [ -f ~/.pypirc ]; then
+        # 使用 Python 或 sed 提取 password 字段
+        if command -v python3 &> /dev/null; then
+            TOKEN=$(python3 -c "
+import configparser
+import os
+config = configparser.ConfigParser()
+config.read(os.path.expanduser('~/.pypirc'))
+if 'pypi' in config and 'password' in config['pypi']:
+    print(config['pypi']['password'])
+" 2>/dev/null)
+            if [ -n "$TOKEN" ]; then
+                echo "$TOKEN"
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
 # 配置 Token
 setup_token() {
-    if [ -z "$UV_PUBLISH_TOKEN" ]; then
-        # 检查 keyring 中是否已配置
-        if keyring get pypi __token__ &>/dev/null; then
-            info "检测到 keyring 中已配置 PyPI 凭据"
-            success "将使用 ~/.pypirc + keyring 进行认证"
-        else
-            warning "未设置 UV_PUBLISH_TOKEN 环境变量，也未在 keyring 中配置凭据"
-            info ""
-            info "Token 配置方式 (PyPI 必须使用 API Token):"
-            echo "  1. keyring 配置 (推荐):"
-            echo "     keyring set pypi __token__"
-            echo "     然后输入你的 PyPI Token"
-            echo ""
-            echo "  2. 环境变量 (临时):"
-            echo "     export UV_PUBLISH_TOKEN='pypi-xxxx...'"
-            echo ""
-            info "获取 Token: https://pypi.org/manage/account/token/"
-            echo ""
-            warning "当前没有配置任何认证方式，uv publish 将提示输入凭据"
-        fi
+    TOKEN=$(get_token)
+    
+    if [ -n "$TOKEN" ]; then
+        # 将 token 导出为环境变量，供后续使用
+        export UV_PUBLISH_TOKEN="$TOKEN"
+        success "已获取 PyPI Token（从环境变量/keyring/.pypirc）"
     else
-        success "将使用 UV_PUBLISH_TOKEN 环境变量进行认证"
+        warning "未找到 PyPI Token 配置"
+        info ""
+        info "Token 配置方式 (PyPI 必须使用 API Token):"
+        echo "  1. keyring 配置 (推荐):"
+        echo "     keyring set pypi __token__"
+        echo "     然后输入你的 PyPI Token"
+        echo ""
+        echo "  2. 环境变量 (临时):"
+        echo "     export UV_PUBLISH_TOKEN='pypi-xxxx...'"
+        echo ""
+        echo "  3. ~/.pypirc 文件:"
+        echo "     [pypi]"
+        echo "     username = __token__"
+        echo "     password = pypi-xxxx..."
+        echo ""
+        info "获取 Token: https://pypi.org/manage/account/token/"
+        echo ""
+        error "未配置任何认证方式，无法发布"
+        exit 1
     fi
 }
 
@@ -136,24 +179,21 @@ publish() {
     
     info "开始上传..."
     
-    # 构建 uv publish 命令
-    # ~/.pypirc 中的 password 配置为从 keyring 读取凭据
+    # 获取 token（setup_token 已确保 token 存在）
+    TOKEN=$(get_token)
+    
+    if [ -z "$TOKEN" ]; then
+        error "无法获取 PyPI Token，请检查配置"
+        exit 1
+    fi
+    
+    # 构建 uv publish 命令，始终使用 --token 参数
     if [ "$TARGET" = "test" ]; then
         # 测试 PyPI
-        if [ -n "$UV_PUBLISH_TOKEN" ]; then
-            uv publish --publish-url "$pypi_url" --token "$UV_PUBLISH_TOKEN"
-        else
-            # uv 会从 ~/.pypirc 读取凭据，自动从 keyring 获取 token
-            uv publish --publish-url "$pypi_url"
-        fi
+        uv publish --publish-url "$pypi_url" --token "$TOKEN"
     else
         # 正式 PyPI (默认 PyPI 地址)
-        if [ -n "$UV_PUBLISH_TOKEN" ]; then
-            uv publish --token "$UV_PUBLISH_TOKEN"
-        else
-            # uv 会从 ~/.pypirc 读取凭据，自动从 keyring 获取 token
-            uv publish
-        fi
+        uv publish --token "$TOKEN"
     fi
     
     success "发布完成！"
