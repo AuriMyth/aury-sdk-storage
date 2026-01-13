@@ -6,16 +6,17 @@ from enum import Enum
 from io import BytesIO
 from typing import Annotated, Any, BinaryIO
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StorageBackend(str, Enum):
     """存储后端类型。"""
 
-    S3 = "s3"
-    LOCAL = "local"
-    OSS = "oss"  # 阿里云 OSS（S3 兼容）
-    COS = "cos"  # 腾讯云 COS（S3 兼容）
+    LOCAL = "local"   # 本地文件系统
+    COS = "cos"       # 腾讯云 COS
+    OSS = "oss"       # 阿里云 OSS
+    AWS = "aws"       # AWS S3
+    MINIO = "minio"   # MinIO
 
 
 class StorageFile(BaseModel):
@@ -31,7 +32,12 @@ class StorageFile(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    """存储配置。"""
+    """存储配置。
+
+    支持两种密钥命名风格（可互换使用）：
+    - AWS 风格: access_key_id / access_key_secret
+    - 腾讯云风格: secret_id / secret_key
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -41,9 +47,14 @@ class StorageConfig(BaseModel):
     bucket_name: str | None = Field(default=None, description="默认桶名")
     region: str | None = Field(default=None, description="区域")
 
-    # S3 兼容配置
+    # 密钥配置（支持两种命名风格）
+    # AWS 风格
     access_key_id: str | None = Field(default=None, description="访问密钥 ID")
     access_key_secret: str | None = Field(default=None, description="访问密钥")
+    # 腾讯云风格（别名）
+    secret_id: str | None = Field(default=None, description="腾讯云 SecretId（等同 access_key_id）")
+    secret_key: str | None = Field(default=None, description="腾讯云 SecretKey（等同 access_key_secret）")
+
     session_token: str | None = Field(default=None, description="会话令牌（STS 临时凭证）")
     endpoint: str | None = Field(default=None, description="端点 URL")
     addressing_style: Annotated[
@@ -60,6 +71,19 @@ class StorageConfig(BaseModel):
     sts_endpoint: str | None = Field(default=None, description="STS 端点")
     sts_region: str | None = Field(default=None, description="STS 区域")
     sts_duration_seconds: int = Field(default=3600, ge=900, le=43200, description="STS 凭证有效期")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_keys(cls, data: dict) -> dict:
+        """统一密钥命名：将 secret_id/secret_key 映射到 access_key_id/access_key_secret。"""
+        if isinstance(data, dict):
+            # secret_id -> access_key_id
+            if data.get("secret_id") and not data.get("access_key_id"):
+                data["access_key_id"] = data["secret_id"]
+            # secret_key -> access_key_secret
+            if data.get("secret_key") and not data.get("access_key_secret"):
+                data["access_key_secret"] = data["secret_key"]
+        return data
 
     @field_validator("addressing_style")
     @classmethod

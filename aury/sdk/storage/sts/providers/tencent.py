@@ -258,7 +258,7 @@ class TencentSTSProvider(ISTSProvider):
             session_token=credentials.get("Token", ""),
             expiration=expiration,
             region=request.region,
-            endpoint=self._config.get_cos_endpoint(request.region),
+            endpoint=self._config.get_endpoint(request.region),
             bucket=request.bucket,
         )
 
@@ -297,7 +297,7 @@ class TencentSTSProvider(ISTSProvider):
             session_token=credentials.get("Token", ""),
             expiration=expiration,
             region=request.region,
-            endpoint=self._config.get_cos_endpoint(request.region),
+            endpoint=self._config.get_endpoint(request.region),
             bucket=request.bucket,
         )
 

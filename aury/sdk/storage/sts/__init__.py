@@ -1,7 +1,7 @@
 """STS 临时凭证模块。"""
 
 from .factory import ProviderType, STSProviderFactory
-from .models import ActionType, STSCredentials, STSRequest, TencentSTSConfig
+from .models import ActionType, COSSTSConfig, STSCredentials, STSRequest, TencentSTSConfig
 from .policy import IPolicyBuilder, TencentPolicyBuilder
 from .provider import ISTSProvider
 from .providers import TencentSTSProvider
@@ -11,7 +11,8 @@ __all__ = [
     "ActionType",
     "STSCredentials",
     "STSRequest",
-    "TencentSTSConfig",
+    "COSSTSConfig",
+    "TencentSTSConfig",  # 别名，兼容
     # Provider
     "ISTSProvider",
     "TencentSTSProvider",

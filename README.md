@@ -5,7 +5,8 @@
 ## 特性
 
 - **STS 临时凭证签发**：支持腾讯云 COS（不依赖第三方 SDK，自实现 TC3-HMAC-SHA256 签名）
-- **S3 兼容存储**：支持 AWS S3、MinIO、腾讯云 COS、阿里云 OSS 等
+- **多存储后端**：支持腾讯云 COS（原生 SDK）、AWS S3、MinIO、阿里云 OSS 等
+- **工厂模式**：通过 `StorageFactory` 统一创建存储实例，支持从 STS 凭证直接创建
 - **统一接口**：不同云厂商使用统一的 API
 - **类型安全**：完整的 Pydantic 模型和类型注解
 - **异步优先**：基于 asyncio，支持高并发场景
@@ -16,7 +17,10 @@
 # 基础安装（STS + 本地存储）
 uv add aury-sdk-storage
 
-# 包含 S3 存储支持
+# 腾讯云 COS 存储（推荐，使用官方 SDK）
+uv add "aury-sdk-storage[cos]"
+
+# S3 兼容存储（AWS S3、MinIO、OSS 等）
 uv add "aury-sdk-storage[aws]"
 ```
 
@@ -34,9 +38,9 @@ from aury.sdk.storage.sts import (
 )
 
 async def main():
-    # 创建腾讯云 STS Provider
+    # 创建 COS STS Provider（腾讯云）
     provider = STSProviderFactory.create(
-        ProviderType.TENCENT,
+        ProviderType.COS,
         secret_id="your-secret-id",
         secret_key="your-secret-key",
     )
@@ -60,29 +64,26 @@ async def main():
 asyncio.run(main())
 ```
 
-### 存储操作
+### 存储操作（推荐：使用工厂模式）
 
 ```python
 import asyncio
 from aury.sdk.storage.storage import (
-    StorageConfig,
-    StorageBackend,
+    StorageFactory,
+    StorageType,
     StorageFile,
-    S3Storage,
 )
 
 async def main():
-    config = StorageConfig(
-        backend=StorageBackend.COS,
+    # 使用工厂创建 COS 存储
+    storage = StorageFactory.create(
+        StorageType.COS,
         bucket_name="my-bucket-1250000000",
         region="ap-guangzhou",
-        endpoint="https://cos.ap-guangzhou.myqcloud.com",
         access_key_id="your-access-key",
         access_key_secret="your-secret-key",
         session_token="your-session-token",  # 可选，使用 STS 临时凭证时需要
     )
-
-    storage = S3Storage(config)
 
     # 上传文件
     result = await storage.upload_file(
@@ -134,7 +135,7 @@ class ActionType(str, Enum):
 ```python
 # AssumeRole 模式
 provider = STSProviderFactory.create(
-    ProviderType.TENCENT,
+    ProviderType.COS,
     secret_id="your-secret-id",
     secret_key="your-secret-key",
     role_arn="qcs::cam::uin/100000000001:roleName/my-role",  # 指定角色
@@ -174,17 +175,44 @@ STSRequest(
 }
 ```
 
-### 统一凭证格式
+### 统一密钥命名
 
-不同云厂商的凭证字段名不同，SDK 统一为 AWS 标准命名：
+SDK 支持两种密钥命名风格，可互换使用：
+
+| AWS 风格 | 腾讯云风格 | 说明 |
+|---------|---------|------|
+| access_key_id | secret_id | 访问密钥 ID |
+| access_key_secret | secret_key | 访问密钥 |
+
+这样可以使用相同的配置创建 STS Provider 和 Storage：
+
+```python
+import os
+
+# 统一配置
+COS_CONFIG = {
+    "secret_id": os.environ["COS_SECRET_ID"],
+    "secret_key": os.environ["COS_SECRET_KEY"],
+    "region": "ap-guangzhou",
+    "bucket_name": "my-bucket-1250000000",
+}
+
+# 创建 STS Provider
+sts_provider = STSProviderFactory.create(ProviderType.COS, **COS_CONFIG)
+
+# 创建 Storage（相同的配置！）
+storage = StorageFactory.create(StorageType.COS, **COS_CONFIG)
+```
+
+### STS 返回的凭证格式
+
+STS 返回的临时凭证统一为 AWS 标准命名，前端可直接使用：
 
 | SDK 字段 | AWS | 腾讯云 | 阿里云 |
 |---------|-----|-------|-------|
 | access_key_id | AccessKeyId | TmpSecretId | AccessKeyId |
 | secret_access_key | SecretAccessKey | TmpSecretKey | AccessKeySecret |
 | session_token | SessionToken | Token | SecurityToken |
-
-前端可直接使用这些字段配置 AWS S3 SDK。
 
 ## 架构设计
 
@@ -200,7 +228,9 @@ aury.sdk.storage/
 ├── storage/               # 存储操作模块
 │   ├── models.py          # Pydantic 数据模型
 │   ├── base.py           # IStorage 接口 + LocalStorage
-│   └── s3.py             # S3 兼容存储实现
+│   ├── s3.py             # S3 兼容存储实现（aioboto3）
+│   ├── cos.py            # 腾讯云 COS 原生实现（cos-python-sdk-v5）
+│   └── factory.py        # Storage 工厂
 └── exceptions.py          # 异常定义
 ```
 
@@ -241,7 +271,7 @@ aury.sdk.storage/
 | endpoint | str | S3 端点 |
 | bucket | str | 桶名 |
 
-### TencentSTSConfig
+### COSSTSConfig
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |-----|------|-----|-------|------|
@@ -267,7 +297,7 @@ from aury.sdk.storage.sts import (
 async def get_upload_credentials(user_id: str):
     """后端 API：为用户生成上传凭证"""
     provider = STSProviderFactory.create(
-        ProviderType.TENCENT,
+        ProviderType.COS,
         secret_id="your-secret-id",
         secret_key="your-secret-key",
     )
@@ -340,7 +370,7 @@ full_access_request = STSRequest(
 
 ```python
 from aury.sdk.storage.sts import (
-    TencentSTSConfig,
+    COSSTSConfig,
     TencentSTSProvider,
     STSRequest,
 )
@@ -348,9 +378,9 @@ from aury.sdk.storage.sts import (
 # 从环境变量或配置文件加载
 import os
 
-config = TencentSTSConfig(
-    secret_id=os.environ["TENCENT_SECRET_ID"],
-    secret_key=os.environ["TENCENT_SECRET_KEY"],
+config = COSSTSConfig(
+    secret_id=os.environ["COS_SECRET_ID"],
+    secret_key=os.environ["COS_SECRET_KEY"],
     region="ap-guangzhou",
     appid="1250000000",  # 可选，也可从 bucket 名自动提取
 )
@@ -369,7 +399,7 @@ from aury.sdk.storage.sts import STSProviderFactory, ProviderType
 
 # 使用 AssumeRole 模式（适合跨账号或更细粒度控制）
 provider = STSProviderFactory.create(
-    ProviderType.TENCENT,
+    ProviderType.COS,
     secret_id="your-secret-id",
     secret_key="your-secret-key",
     role_arn="qcs::cam::uin/100000000001:roleName/my-storage-role",
@@ -379,10 +409,13 @@ provider = STSProviderFactory.create(
 ### 本地存储（开发测试）
 
 ```python
-from aury.sdk.storage.storage import LocalStorage, StorageFile
+from aury.sdk.storage.storage import StorageFactory, StorageType, StorageFile
 
-# 本地文件系统存储，用于开发测试
-storage = LocalStorage(base_path="./dev_storage")
+# 使用工厂创建本地存储（用于开发测试）
+storage = StorageFactory.create(
+    StorageType.LOCAL,
+    base_path="./dev_storage",
+)
 
 # 上传文件
 result = await storage.upload_file(
@@ -401,27 +434,23 @@ content = await storage.download_file("images/avatar.png")
 await storage.delete_file("images/avatar.png")
 ```
 
-### S3 兼容存储（腾讯云 COS）
+### 腾讯云 COS 存储（推荐）
 
 ```python
 from aury.sdk.storage.storage import (
-    S3Storage,
-    StorageConfig,
-    StorageBackend,
+    StorageFactory,
+    StorageType,
     StorageFile,
 )
 
-# 使用长期密钥
-config = StorageConfig(
-    backend=StorageBackend.COS,
+# 使用工厂创建 COS 存储（使用腾讯云风格密钥名）
+storage = StorageFactory.create(
+    StorageType.COS,
     bucket_name="my-bucket-1250000000",
     region="ap-guangzhou",
-    endpoint="https://cos.ap-guangzhou.myqcloud.com",
-    access_key_id="your-secret-id",
-    access_key_secret="your-secret-key",
+    secret_id="your-secret-id",
+    secret_key="your-secret-key",
 )
-
-storage = S3Storage(config)
 
 # 上传带元数据的文件
 result = await storage.upload_file(
@@ -451,7 +480,23 @@ url = await storage.get_file_url(
 print(f"下载链接: {url}")
 ```
 
-### 结合 STS 和存储
+### COS 全球加速域名
+
+```python
+from aury.sdk.storage.storage import StorageFactory, StorageType
+
+# 使用全球加速域名
+storage = StorageFactory.create(
+    StorageType.COS,
+    bucket_name="my-bucket-1250000000",
+    region="ap-guangzhou",
+    endpoint="https://cos.accelerate.myqcloud.com",  # 全球加速域名
+    secret_id="your-secret-id",
+    secret_key="your-secret-key",
+)
+```
+
+### 结合 STS 和存储（推荐）
 
 ```python
 from aury.sdk.storage.sts import (
@@ -461,9 +506,7 @@ from aury.sdk.storage.sts import (
     ActionType,
 )
 from aury.sdk.storage.storage import (
-    S3Storage,
-    StorageConfig,
-    StorageBackend,
+    StorageFactory,
     StorageFile,
 )
 
@@ -472,7 +515,7 @@ async def upload_with_sts(user_id: str, file_data: bytes, filename: str):
 
     # 1. 获取 STS 凭证
     sts_provider = STSProviderFactory.create(
-        ProviderType.TENCENT,
+        ProviderType.COS,
         secret_id="your-secret-id",
         secret_key="your-secret-key",
     )
@@ -486,18 +529,9 @@ async def upload_with_sts(user_id: str, file_data: bytes, filename: str):
         )
     )
 
-    # 2. 使用临时凭证上传
-    storage_config = StorageConfig(
-        backend=StorageBackend.COS,
-        bucket_name=credentials.bucket,
-        region=credentials.region,
-        endpoint=credentials.endpoint,
-        access_key_id=credentials.access_key_id,
-        access_key_secret=credentials.secret_access_key,
-        session_token=credentials.session_token,
-    )
+    # 2. 直接从 STS 凭证创建存储实例（推荐）
+    storage = StorageFactory.from_sts_credentials(credentials)
 
-    storage = S3Storage(storage_config)
     result = await storage.upload_file(
         StorageFile(
             object_name=f"user/{user_id}/{filename}",
@@ -609,7 +643,7 @@ app = FastAPI()
 
 # 全局 Provider（复用 HTTP 连接）
 sts_provider = STSProviderFactory.create(
-    ProviderType.TENCENT,
+    ProviderType.COS,
     secret_id="your-secret-id",
     secret_key="your-secret-key",
 )

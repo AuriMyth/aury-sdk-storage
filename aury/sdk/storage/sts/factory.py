@@ -7,7 +7,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
-from .models import TencentSTSConfig
+from .models import COSSTSConfig
 from .provider import ISTSProvider
 from .providers.tencent import TencentSTSProvider
 
@@ -15,9 +15,9 @@ from .providers.tencent import TencentSTSProvider
 class ProviderType(str, Enum):
     """Provider 类型。"""
 
-    TENCENT = "tencent"
-    ALIYUN = "aliyun"
-    AWS = "aws"
+    COS = "cos"      # 腾讯云 COS
+    OSS = "oss"      # 阿里云 OSS
+    S3 = "s3"        # AWS S3
 
 
 class STSProviderFactory:
@@ -26,22 +26,22 @@ class STSProviderFactory:
     使用示例:
         # 方式1: 直接创建
         provider = STSProviderFactory.create(
-            ProviderType.TENCENT,
+            ProviderType.COS,
             secret_id="...",
             secret_key="...",
         )
 
         # 方式2: 从 Pydantic 配置创建
-        config = TencentSTSConfig(secret_id="...", secret_key="...")
-        provider = STSProviderFactory.from_config(ProviderType.TENCENT, config)
+        config = COSSTSConfig(secret_id="...", secret_key="...")
+        provider = STSProviderFactory.from_config(ProviderType.COS, config)
     """
 
     _providers: ClassVar[dict[ProviderType, type[ISTSProvider]]] = {
-        ProviderType.TENCENT: TencentSTSProvider,
+        ProviderType.COS: TencentSTSProvider,
     }
 
     _config_classes: ClassVar[dict[ProviderType, type[BaseModel]]] = {
-        ProviderType.TENCENT: TencentSTSConfig,
+        ProviderType.COS: COSSTSConfig,
     }
 
     @classmethod

@@ -65,36 +65,41 @@ class STSCredentials(BaseModel):
     bucket: str | None = Field(default=None, description="桶名")
 
 
-class TencentSTSConfig(BaseModel):
-    """腾讯云 STS Provider 配置。"""
+class COSSTSConfig(BaseModel):
+    """COS STS Provider 配置（腾讯云）。"""
 
     model_config = ConfigDict(frozen=True)
 
-    secret_id: str = Field(..., description="腾讯云 SecretId")
-    secret_key: str = Field(..., description="腾讯云 SecretKey")
+    secret_id: str = Field(..., description="SecretId")
+    secret_key: str = Field(..., description="SecretKey")
     region: str = Field(default="ap-guangzhou", description="默认区域")
 
     # 可选：用于 AssumeRole 模式
     role_arn: str | None = Field(default=None, description="角色 ARN（AssumeRole 模式）")
 
     # appid 用于构造资源 ARN
-    appid: str | None = Field(default=None, description="腾讯云 AppId（从 bucket 名解析或显式指定）")
+    appid: str | None = Field(default=None, description="AppId（从 bucket 名解析或显式指定）")
 
     # 返回给 client 的 S3 端点
-    cos_endpoint_template: str = Field(
+    endpoint_template: str = Field(
         default="https://cos.{region}.myqcloud.com",
         description="COS S3 兼容端点模板",
     )
 
-    def get_cos_endpoint(self, region: str | None = None) -> str:
+    def get_endpoint(self, region: str | None = None) -> str:
         """获取 COS S3 兼容端点。"""
         r = region or self.region
-        return self.cos_endpoint_template.format(region=r)
+        return self.endpoint_template.format(region=r)
+
+
+# 别名，兼容旧代码
+TencentSTSConfig = COSSTSConfig
 
 
 __all__ = [
     "ActionType",
     "STSRequest",
     "STSCredentials",
-    "TencentSTSConfig",
+    "COSSTSConfig",
+    "TencentSTSConfig",  # 别名，兼容
 ]

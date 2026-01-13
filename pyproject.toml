@@ -7,7 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
-    "aioboto3>=15.5.0",
 ]
 
 [tool.uv]
@@ -18,6 +17,7 @@ source = "vcs"
 
 [project.optional-dependencies]
 aws = ["aioboto3>=13.0"]
+cos = ["cos-python-sdk-v5>=1.9.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [build-system]
