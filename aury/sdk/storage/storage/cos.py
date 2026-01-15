@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-from io import BytesIO
 from typing import TYPE_CHECKING, Any
 
 from aury.sdk.storage.exceptions import StorageBackendError, StorageNotFoundError
@@ -105,17 +104,10 @@ class COSStorage(IStorage):
         return file.data.read()
 
     def _build_url(self, bucket: str, object_name: str) -> str:
-        """构建对象 URL。"""
-        if self._config.endpoint:
-            # 自定义端点
-            endpoint = self._config.endpoint.rstrip("/")
-            return f"{endpoint}/{bucket}/{object_name}"
-        elif self._config.region:
-            # 标准 COS 域名
-            return f"https://{bucket}.cos.{self._config.region}.myqcloud.com/{object_name}"
-        else:
-            # 回退
-            return f"cos://{bucket}/{object_name}"
+        """构建对象 URL（使用 SDK 自带方法）。"""
+        # 使用 COS SDK 自带的 get_object_url 方法生成 URL
+        # 这样可以自动处理 virtual host 格式、全球加速域名、自定义域名等各种情况
+        return self._client.get_object_url(Bucket=bucket, Key=object_name)
 
     async def upload_file(
         self,
@@ -209,9 +201,10 @@ class COSStorage(IStorage):
         self._ensure_initialized()
         bucket = self._get_bucket(bucket_name)
 
+        loop = asyncio.get_event_loop()
+        
         if expires_in:
-            # 生成预签名 URL
-            loop = asyncio.get_event_loop()
+            # 生成带过期时间的预签名 URL
             try:
                 url = await loop.run_in_executor(
                     None,
@@ -225,8 +218,12 @@ class COSStorage(IStorage):
                 return url
             except (CosServiceError, CosClientError) as e:
                 raise StorageBackendError(f"生成预签名 URL 失败: {e}") from e
-
-        return self._build_url(bucket, object_name)
+        
+        # 生成永久 URL（使用 SDK 方法）
+        return await loop.run_in_executor(
+            None,
+            lambda: self._client.get_object_url(Bucket=bucket, Key=object_name),
+        )
 
     async def file_exists(
         self,
