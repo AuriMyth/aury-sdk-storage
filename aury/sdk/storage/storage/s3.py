@@ -223,6 +223,41 @@ class S3Storage(IStorage):
             async with response["Body"] as stream:
                 return await stream.read()
 
+    async def append_file(
+        self,
+        object_name: str,
+        data: bytes,
+        *,
+        bucket_name: str | None = None,
+        position: int | None = None,
+    ) -> int:
+        """追加内容到文件。
+
+        S3 不支持原生追加，使用下载->追加->重新上传的方式。
+        对于支持 APPEND 的存储（如 COS），应使用 COSStorage。
+        """
+        bucket = self._get_bucket(bucket_name)
+
+        # 尝试下载现有内容
+        existing_data = b""
+        try:
+            existing_data = await self.download_file(object_name, bucket_name=bucket)
+        except Exception:
+            # 文件不存在，从空开始
+            pass
+
+        # 追加新数据
+        new_data = existing_data + data
+
+        # 重新上传
+        from .models import StorageFile
+        await self.upload_file(
+            StorageFile(object_name=object_name, data=new_data),
+            bucket_name=bucket,
+        )
+
+        return len(new_data)
+
 
 __all__ = [
     "S3Storage",

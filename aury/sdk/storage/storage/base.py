@@ -122,6 +122,29 @@ class IStorage(ABC):
         """
         pass
 
+    @abstractmethod
+    async def append_file(
+        self,
+        object_name: str,
+        data: bytes,
+        *,
+        bucket_name: str | None = None,
+        position: int | None = None,
+    ) -> int:
+        """追加内容到文件。
+
+        如果文件不存在则创建。返回追加后的文件位置（下次追加的 position）。
+
+        Args:
+            object_name: 对象名
+            data: 追加的数据
+            bucket_name: 桶名（可选）
+            position: 追加位置（None 表示追加到末尾）
+
+        Returns:
+            追加后的文件位置
+        """
+        pass
 
 
 class LocalStorage(IStorage):
@@ -234,6 +257,26 @@ class LocalStorage(IStorage):
 
         with open(file_path, "rb") as f:
             return f.read()
+
+    async def append_file(
+        self,
+        object_name: str,
+        data: bytes,
+        *,
+        bucket_name: str | None = None,
+        position: int | None = None,
+    ) -> int:
+        """追加内容到文件。"""
+        bucket = bucket_name or "default"
+        file_path = self._get_file_path(bucket, object_name)
+
+        # 确保目录存在
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+        # 追加写入
+        with open(file_path, "ab") as f:
+            f.write(data)
+            return f.tell()
 
 
 __all__ = [

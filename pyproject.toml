@@ -17,7 +17,6 @@ source = "vcs"
 
 [project.optional-dependencies]
 aws = ["aioboto3>=13.0"]
-cos = ["cos-python-sdk-v5>=1.9.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [build-system]

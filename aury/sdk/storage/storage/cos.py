@@ -1,41 +1,29 @@
-"""腾讯云 COS 存储实现（使用官方 cos-python-sdk-v5）。
+"""腾讯云 COS 存储实现（纯 httpx 异步版本）。
 
-使用腾讯云官方 SDK，避免 S3 兼容层的一些问题。
-需要安装可选依赖: pip install cos-python-sdk-v5
+不依赖官方 SDK，直接使用 httpx 调用 COS REST API。
+支持全球加速域名和自定义域名。
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+import hashlib
+import hmac
+import time
+from urllib.parse import quote, urlencode
+
+import httpx
 
 from aury.sdk.storage.exceptions import StorageBackendError, StorageNotFoundError
 
 from .base import IStorage
 from .models import StorageConfig, StorageFile, UploadResult
 
-# 延迟导入 cos sdk（可选依赖）
-try:
-    from qcloud_cos import CosConfig, CosS3Client
-    from qcloud_cos.cos_exception import CosClientError, CosServiceError
-
-    _COS_SDK_AVAILABLE = True
-except ImportError:
-    _COS_SDK_AVAILABLE = False
-    if TYPE_CHECKING:
-        from qcloud_cos import CosConfig, CosS3Client
-        from qcloud_cos.cos_exception import CosClientError, CosServiceError
-    else:
-        CosConfig = None
-        CosS3Client = None
-        CosClientError = Exception
-        CosServiceError = Exception
-
 
 class COSStorage(IStorage):
-    """腾讯云 COS 存储实现（使用官方 SDK）。
+    """腾讯云 COS 存储实现（纯 httpx 异步版本）。
 
-    相比 S3Storage，使用腾讯云官方 SDK 可以避免一些兼容性问题。
+    直接使用 httpx 调用 COS REST API，无需安装 cos-python-sdk-v5。
     支持全球加速域名和自定义域名。
     """
 
@@ -45,48 +33,14 @@ class COSStorage(IStorage):
         Args:
             config: 存储配置
         """
-        if not _COS_SDK_AVAILABLE:
-            raise ImportError(
-                "cos-python-sdk-v5 未安装。请安装可选依赖: pip install 'aury-sdk-storage[cos]'"
-            )
-
         self._config = config
-        self._client: CosS3Client | None = None
-        self._initialized = False
+        self._client: httpx.AsyncClient | None = None
 
-    def _ensure_initialized(self) -> None:
-        """确保已初始化。"""
-        if not self._initialized:
-            # 构建 CosConfig
-            cos_config_kwargs: dict[str, Any] = {
-                "Region": self._config.region,
-                "SecretId": self._config.access_key_id,
-                "SecretKey": self._config.access_key_secret,
-                "Scheme": "https",
-            }
-
-            # 如果有 session_token，添加 Token
-            if self._config.session_token:
-                cos_config_kwargs["Token"] = self._config.session_token
-
-            # 如果指定了 endpoint，使用 Endpoint 初始化（全球加速或自定义域名）
-            if self._config.endpoint:
-                # 从 endpoint URL 提取域名
-                endpoint = self._config.endpoint
-                if endpoint.startswith("https://"):
-                    endpoint = endpoint[8:]
-                elif endpoint.startswith("http://"):
-                    endpoint = endpoint[7:]
-                # 去除尾部斜杠
-                endpoint = endpoint.rstrip("/")
-
-                cos_config_kwargs["Endpoint"] = endpoint
-                # 使用 Endpoint 时 Region 可为 None
-                cos_config_kwargs["Region"] = self._config.region or None
-
-            cos_cfg = CosConfig(**cos_config_kwargs)
-            self._client = CosS3Client(cos_cfg)
-            self._initialized = True
+    def _ensure_client(self) -> httpx.AsyncClient:
+        """确保 httpx 客户端已创建。"""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=60.0)
+        return self._client
 
     def _get_bucket(self, bucket_name: str | None) -> str:
         """获取桶名。"""
@@ -94,6 +48,34 @@ class COSStorage(IStorage):
         if not bucket:
             raise StorageBackendError("桶名未指定")
         return bucket
+
+    def _get_host(self, bucket: str) -> str:
+        """获取请求 Host。
+
+        支持:
+        - 自定义 endpoint（全球加速域名等）
+        - 默认域名格式: {bucket}.cos.{region}.myqcloud.com
+        """
+        if self._config.endpoint:
+            endpoint = self._config.endpoint
+            if endpoint.startswith("https://"):
+                endpoint = endpoint[8:]
+            elif endpoint.startswith("http://"):
+                endpoint = endpoint[7:]
+            endpoint = endpoint.rstrip("/")
+            # 如果 endpoint 已包含 bucket，直接返回
+            if bucket in endpoint:
+                return endpoint
+            return f"{bucket}.{endpoint}"
+
+        if not self._config.region:
+            raise StorageBackendError("Region 或 Endpoint 必须指定")
+        return f"{bucket}.cos.{self._config.region}.myqcloud.com"
+
+    def _get_base_url(self, bucket: str) -> str:
+        """获取基础 URL。"""
+        host = self._get_host(bucket)
+        return f"https://{host}"
 
     def _read_file_data(self, file: StorageFile) -> bytes:
         """读取文件数据。"""
@@ -103,11 +85,149 @@ class COSStorage(IStorage):
             return file.data
         return file.data.read()
 
+    # ==================== COS 签名算法 ====================
+
+    def _sign(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+        expire: int = 10000,
+    ) -> str:
+        """生成 COS 签名。
+
+        COS 签名算法文档: https://cloud.tencent.com/document/product/436/7778
+
+        Args:
+            method: HTTP 方法 (GET/PUT/POST/DELETE/HEAD)
+            path: 请求路径 (以 / 开头)
+            params: URL 参数
+            headers: 请求头
+            expire: 签名有效期（秒）
+
+        Returns:
+            Authorization header 值
+        """
+        secret_id = self._config.access_key_id
+        secret_key = self._config.access_key_secret
+
+        if not secret_id or not secret_key:
+            raise StorageBackendError("缺少访问密钥")
+
+        params = params or {}
+        headers = headers or {}
+
+        # 1. 过滤并格式化 headers
+        sign_headers = self._filter_headers(headers)
+
+        # 2. 构建 HttpString
+        # 格式: {method}\n{path}\n{params}\n{headers}\n
+        param_str = "&".join(
+            f"{quote(k.lower(), safe='-_.~')}={quote(str(v), safe='-_.~')}"
+            for k, v in sorted(params.items())
+        )
+        header_str = "&".join(
+            f"{quote(k.lower(), safe='-_.~')}={quote(str(v), safe='-_.~')}"
+            for k, v in sorted(sign_headers.items())
+        )
+        http_string = f"{method.lower()}\n{path}\n{param_str}\n{header_str}\n"
+
+        # 3. 计算签名时间
+        start_time = int(time.time()) - 60
+        end_time = start_time + expire + 60
+        sign_time = f"{start_time};{end_time}"
+
+        # 4. 计算 StringToSign
+        sha1_hash = hashlib.sha1(http_string.encode("utf-8")).hexdigest()
+        string_to_sign = f"sha1\n{sign_time}\n{sha1_hash}\n"
+
+        # 5. 计算签名
+        sign_key = hmac.new(
+            secret_key.encode("utf-8"),
+            sign_time.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+        signature = hmac.new(
+            sign_key.encode("utf-8"),
+            string_to_sign.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+
+        # 6. 拼接 Authorization
+        auth = (
+            f"q-sign-algorithm=sha1"
+            f"&q-ak={secret_id}"
+            f"&q-sign-time={sign_time}"
+            f"&q-key-time={sign_time}"
+            f"&q-header-list={';'.join(sorted(k.lower() for k in sign_headers.keys()))}"
+            f"&q-url-param-list={';'.join(sorted(k.lower() for k in params.keys()))}"
+            f"&q-signature={signature}"
+        )
+
+        return auth
+
+    def _filter_headers(self, headers: dict[str, str]) -> dict[str, str]:
+        """过滤参与签名的 headers。
+
+        只有以下 headers 参与签名:
+        - host
+        - content-type
+        - content-md5
+        - content-length
+        - x-cos-* 开头的
+        """
+        valid_headers = {
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "content-type",
+            "content-md5",
+            "content-length",
+            "expect",
+            "expires",
+            "host",
+            "if-match",
+            "if-modified-since",
+            "if-none-match",
+            "if-unmodified-since",
+            "origin",
+            "range",
+            "transfer-encoding",
+        }
+        result = {}
+        for k, v in headers.items():
+            key_lower = k.lower()
+            if key_lower in valid_headers or key_lower.startswith("x-cos-"):
+                result[k] = v
+        return result
+
     def _build_url(self, bucket: str, object_name: str) -> str:
-        """构建对象 URL（使用 SDK 自带方法）。"""
-        # 使用 COS SDK 自带的 get_object_url 方法生成 URL
-        # 这样可以自动处理 virtual host 格式、全球加速域名、自定义域名等各种情况
-        return self._client.get_object_url(Bucket=bucket, Key=object_name)
+        """构建对象永久 URL。"""
+        host = self._get_host(bucket)
+        # object_name 需要 URL 编码，但保留 /
+        encoded_name = quote(object_name, safe="/-_.~")
+        return f"https://{host}/{encoded_name}"
+
+    def _get_presigned_url(
+        self,
+        bucket: str,
+        object_name: str,
+        method: str = "GET",
+        expires_in: int = 3600,
+    ) -> str:
+        """生成预签名 URL。"""
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+        encoded_path = quote(path, safe="/-_.~")
+
+        # 签名需要包含 host
+        headers = {"host": host}
+        auth = self._sign(method, path, params={}, headers=headers, expire=expires_in)
+
+        return f"https://{host}{encoded_path}?{auth}"
+
+    # ==================== IStorage 接口实现 ====================
 
     async def upload_file(
         self,
@@ -116,39 +236,43 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> UploadResult:
         """上传文件。"""
-        self._ensure_initialized()
+        client = self._ensure_client()
         bucket = self._get_bucket(bucket_name or file.bucket_name)
         data = self._read_file_data(file)
 
-        # 构建上传参数
-        put_kwargs: dict[str, Any] = {
-            "Bucket": bucket,
-            "Key": file.object_name,
-            "Body": data,
+        host = self._get_host(bucket)
+        path = "/" + file.object_name if not file.object_name.startswith("/") else file.object_name
+        url = f"https://{host}{quote(path, safe='/-_.~')}"
+
+        # 构建请求头
+        headers: dict[str, str] = {
+            "host": host,
+            "content-length": str(len(data)),
         }
-
         if file.content_type:
-            put_kwargs["ContentType"] = file.content_type
+            headers["content-type"] = file.content_type
 
+        # 添加自定义元数据
         if file.metadata:
-            # COS SDK 支持自定义元数据，以 x-cos-meta- 前缀存储
-            put_kwargs["Metadata"] = file.metadata
+            for k, v in file.metadata.items():
+                headers[f"x-cos-meta-{k}"] = v
 
-        # COS SDK 是同步的，使用 run_in_executor 包装
-        loop = asyncio.get_event_loop()
+        # 添加 STS Token
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+
+        # 生成签名
+        headers["authorization"] = self._sign("PUT", path, params={}, headers=headers)
+
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: self._client.put_object(**put_kwargs),
-            )
-        except CosServiceError as e:
-            raise StorageBackendError(
-                f"COS 上传失败: [{e.get_error_code()}] {e.get_error_msg()}"
-            ) from e
-        except CosClientError as e:
-            raise StorageBackendError(f"COS 客户端错误: {e}") from e
+            response = await client.put(url, content=data, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise StorageBackendError(f"COS 上传失败: {e.response.status_code} {e.response.text}") from e
+        except httpx.RequestError as e:
+            raise StorageBackendError(f"COS 请求失败: {e}") from e
 
-        etag = response.get("ETag", "").strip('"')
+        etag = response.headers.get("etag", "").strip('"')
 
         return UploadResult(
             url=self._build_url(bucket, file.object_name),
@@ -174,21 +298,27 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> None:
         """删除文件。"""
-        self._ensure_initialized()
+        client = self._ensure_client()
         bucket = self._get_bucket(bucket_name)
 
-        loop = asyncio.get_event_loop()
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+        url = f"https://{host}{quote(path, safe='/-_.~')}"
+
+        headers: dict[str, str] = {"host": host}
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+        headers["authorization"] = self._sign("DELETE", path, params={}, headers=headers)
+
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._client.delete_object(Bucket=bucket, Key=object_name),
-            )
-        except CosServiceError as e:
-            raise StorageBackendError(
-                f"COS 删除失败: [{e.get_error_code()}] {e.get_error_msg()}"
-            ) from e
-        except CosClientError as e:
-            raise StorageBackendError(f"COS 客户端错误: {e}") from e
+            response = await client.delete(url, headers=headers)
+            # 404 也算成功（文件本来就不存在）
+            if response.status_code not in (200, 204, 404):
+                response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise StorageBackendError(f"COS 删除失败: {e.response.status_code} {e.response.text}") from e
+        except httpx.RequestError as e:
+            raise StorageBackendError(f"COS 请求失败: {e}") from e
 
     async def get_file_url(
         self,
@@ -198,32 +328,11 @@ class COSStorage(IStorage):
         expires_in: int | None = None,
     ) -> str:
         """获取文件 URL。"""
-        self._ensure_initialized()
         bucket = self._get_bucket(bucket_name)
 
-        loop = asyncio.get_event_loop()
-        
         if expires_in:
-            # 生成带过期时间的预签名 URL
-            try:
-                url = await loop.run_in_executor(
-                    None,
-                    lambda: self._client.get_presigned_url(
-                        Bucket=bucket,
-                        Key=object_name,
-                        Method="GET",
-                        Expired=expires_in,
-                    ),
-                )
-                return url
-            except (CosServiceError, CosClientError) as e:
-                raise StorageBackendError(f"生成预签名 URL 失败: {e}") from e
-        
-        # 生成永久 URL（使用 SDK 方法）
-        return await loop.run_in_executor(
-            None,
-            lambda: self._client.get_object_url(Bucket=bucket, Key=object_name),
-        )
+            return self._get_presigned_url(bucket, object_name, "GET", expires_in)
+        return self._build_url(bucket, object_name)
 
     async def file_exists(
         self,
@@ -232,24 +341,24 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> bool:
         """检查文件是否存在。"""
-        self._ensure_initialized()
+        client = self._ensure_client()
         bucket = self._get_bucket(bucket_name)
 
-        loop = asyncio.get_event_loop()
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+        url = f"https://{host}{quote(path, safe='/-_.~')}"
+
+        headers: dict[str, str] = {"host": host}
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+        headers["authorization"] = self._sign("HEAD", path, params={}, headers=headers)
+
         try:
-            await loop.run_in_executor(
-                None,
-                lambda: self._client.head_object(Bucket=bucket, Key=object_name),
-            )
-            return True
-        except CosServiceError as e:
-            # 404 表示不存在
-            if e.get_error_code() == "NoSuchKey" or e.get_status_code() == 404:
-                return False
-            raise StorageBackendError(
-                f"COS 检查文件失败: [{e.get_error_code()}] {e.get_error_msg()}"
-            ) from e
-        except CosClientError:
+            response = await client.head(url, headers=headers)
+            return response.status_code == 200
+        except httpx.HTTPStatusError:
+            return False
+        except httpx.RequestError:
             return False
 
     async def download_file(
@@ -259,28 +368,117 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> bytes:
         """下载文件。"""
-        self._ensure_initialized()
+        client = self._ensure_client()
         bucket = self._get_bucket(bucket_name)
 
-        loop = asyncio.get_event_loop()
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+        url = f"https://{host}{quote(path, safe='/-_.~')}"
+
+        headers: dict[str, str] = {"host": host}
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+        headers["authorization"] = self._sign("GET", path, params={}, headers=headers)
+
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: self._client.get_object(Bucket=bucket, Key=object_name),
-            )
-            # response['Body'] 是一个 StreamBody 对象
-            body = response["Body"]
-            # 读取全部内容
-            content = await loop.run_in_executor(None, body.get_raw_stream().read)
-            return content
-        except CosServiceError as e:
-            if e.get_error_code() == "NoSuchKey" or e.get_status_code() == 404:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 404:
+                raise StorageNotFoundError(f"文件不存在: {object_name}")
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
                 raise StorageNotFoundError(f"文件不存在: {object_name}") from e
-            raise StorageBackendError(
-                f"COS 下载失败: [{e.get_error_code()}] {e.get_error_msg()}"
-            ) from e
-        except CosClientError as e:
-            raise StorageBackendError(f"COS 客户端错误: {e}") from e
+            raise StorageBackendError(f"COS 下载失败: {e.response.status_code} {e.response.text}") from e
+        except httpx.RequestError as e:
+            raise StorageBackendError(f"COS 请求失败: {e}") from e
+
+    async def append_file(
+        self,
+        object_name: str,
+        data: bytes,
+        *,
+        bucket_name: str | None = None,
+        position: int | None = None,
+    ) -> int:
+        """追加内容到文件（使用 COS APPEND Object 接口）。
+
+        COS APPEND Object 文档: https://cloud.tencent.com/document/product/436/7741
+
+        Args:
+            object_name: 对象名
+            data: 追加的数据
+            bucket_name: 桶名
+            position: 追加位置（None 表示自动获取当前文件大小）
+
+        Returns:
+            下一次追加的位置
+        """
+        client = self._ensure_client()
+        bucket = self._get_bucket(bucket_name)
+
+        # 如果没有指定 position，先获取当前文件大小
+        if position is None:
+            position = await self._get_file_size(bucket, object_name)
+
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+
+        # 构建 URL 和参数
+        params = {"append": "", "position": str(position)}
+        url = f"https://{host}{quote(path, safe='/-_.~')}?append=&position={position}"
+
+        # 构建请求头
+        headers: dict[str, str] = {
+            "host": host,
+            "content-length": str(len(data)),
+        }
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+
+        # 生成签名（注意：append 和 position 参数需要参与签名）
+        headers["authorization"] = self._sign("POST", path, params=params, headers=headers)
+
+        try:
+            response = await client.post(url, content=data, headers=headers)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise StorageBackendError(f"COS 追加失败: {e.response.status_code} {e.response.text}") from e
+        except httpx.RequestError as e:
+            raise StorageBackendError(f"COS 请求失败: {e}") from e
+
+        # 返回下一次追加的位置
+        next_position = response.headers.get("x-cos-next-append-position")
+        if next_position:
+            return int(next_position)
+        return position + len(data)
+
+    async def _get_file_size(self, bucket: str, object_name: str) -> int:
+        """获取文件大小，如果文件不存在返回 0。"""
+        client = self._ensure_client()
+        host = self._get_host(bucket)
+        path = "/" + object_name if not object_name.startswith("/") else object_name
+        url = f"https://{host}{quote(path, safe='/-_.~')}"
+
+        headers: dict[str, str] = {"host": host}
+        if self._config.session_token:
+            headers["x-cos-security-token"] = self._config.session_token
+        headers["authorization"] = self._sign("HEAD", path, params={}, headers=headers)
+
+        try:
+            response = await client.head(url, headers=headers)
+            if response.status_code == 200:
+                content_length = response.headers.get("content-length")
+                return int(content_length) if content_length else 0
+            return 0
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            return 0
+
+    async def close(self) -> None:
+        """关闭 httpx 客户端。"""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
 
 
 __all__ = [
