@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
+import aiohttp
 
 from aury.sdk.storage.exceptions import STSRequestError, STSSignatureError
 from aury.sdk.storage.sts.models import (
@@ -154,13 +154,14 @@ class TencentSTSProvider(ISTSProvider):
         self._config = config
         self._signer = TencentTC3Signer(config.secret_id, config.secret_key)
         self._policy_builder = TencentPolicyBuilder(appid=config.appid)
-        self._client: httpx.AsyncClient | None = None
+        self._session: aiohttp.ClientSession | None = None
 
-    def _get_client(self) -> httpx.AsyncClient:
-        """获取或创建 HTTP 客户端。"""
-        if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
-        return self._client
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 HTTP 会话。"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=30.0)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
 
     def _extract_appid(self, bucket: str) -> str | None:
         """从 bucket 名提取 appid。"""
@@ -182,23 +183,21 @@ class TencentSTSProvider(ISTSProvider):
         headers = self._signer.sign(action, params, region=region)
         payload = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
 
-        client = self._get_client()
+        session = await self._get_session()
         try:
-            resp = await client.post(
+            async with session.post(
                 TencentTC3Signer.ENDPOINT,
-                content=payload,
+                data=payload,
                 headers=headers,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise STSRequestError(
-                f"HTTP 请求失败: {e.response.status_code}",
-                code="HTTPError",
-            ) from e
-        except httpx.RequestError as e:
+            ) as resp:
+                if resp.status >= 400:
+                    raise STSRequestError(
+                        f"HTTP 请求失败: {resp.status}",
+                        code="HTTPError",
+                    )
+                data = await resp.json()
+        except aiohttp.ClientError as e:
             raise STSRequestError(f"网络请求失败: {e}", code="NetworkError") from e
-
-        data = resp.json()
 
         # 检查 API 错误
         response = data.get("Response", {})

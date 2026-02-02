@@ -1,6 +1,6 @@
-"""腾讯云 COS 存储实现（纯 httpx 异步版本）。
+"""腾讯云 COS 存储实现（纯 aiohttp 异步版本）。
 
-不依赖官方 SDK，直接使用 httpx 调用 COS REST API。
+不依赖官方 SDK，直接使用 aiohttp 调用 COS REST API。
 支持全球加速域名和自定义域名。
 """
 
@@ -12,7 +12,7 @@ import hmac
 import time
 from urllib.parse import quote, urlencode
 
-import httpx
+import aiohttp
 
 from aury.sdk.storage.exceptions import StorageBackendError, StorageNotFoundError
 
@@ -21,9 +21,9 @@ from .models import StorageConfig, StorageFile, UploadResult
 
 
 class COSStorage(IStorage):
-    """腾讯云 COS 存储实现（纯 httpx 异步版本）。
+    """腾讯云 COS 存储实现（纯 aiohttp 异步版本）。
 
-    直接使用 httpx 调用 COS REST API，无需安装 cos-python-sdk-v5。
+    直接使用 aiohttp 调用 COS REST API，无需安装 cos-python-sdk-v5。
     支持全球加速域名和自定义域名。
     """
 
@@ -34,13 +34,14 @@ class COSStorage(IStorage):
             config: 存储配置
         """
         self._config = config
-        self._client: httpx.AsyncClient | None = None
+        self._session: aiohttp.ClientSession | None = None
 
-    def _ensure_client(self) -> httpx.AsyncClient:
-        """确保 httpx 客户端已创建。"""
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
-        return self._client
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        """确保 aiohttp 会话已创建。"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=60.0)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
 
     def _get_bucket(self, bucket_name: str | None) -> str:
         """获取桶名。"""
@@ -236,7 +237,7 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> UploadResult:
         """上传文件。"""
-        client = self._ensure_client()
+        session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name or file.bucket_name)
         data = self._read_file_data(file)
 
@@ -265,14 +266,13 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("PUT", path, params={}, headers=headers)
 
         try:
-            response = await client.put(url, content=data, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise StorageBackendError(f"COS 上传失败: {e.response.status_code} {e.response.text}") from e
-        except httpx.RequestError as e:
+            async with session.put(url, data=data, headers=headers) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise StorageBackendError(f"COS 上传失败: {response.status} {text}")
+                etag = response.headers.get("etag", "").strip('"')
+        except aiohttp.ClientError as e:
             raise StorageBackendError(f"COS 请求失败: {e}") from e
-
-        etag = response.headers.get("etag", "").strip('"')
 
         return UploadResult(
             url=self._build_url(bucket, file.object_name),
@@ -298,7 +298,7 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> None:
         """删除文件。"""
-        client = self._ensure_client()
+        session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name)
 
         host = self._get_host(bucket)
@@ -311,13 +311,12 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("DELETE", path, params={}, headers=headers)
 
         try:
-            response = await client.delete(url, headers=headers)
-            # 404 也算成功（文件本来就不存在）
-            if response.status_code not in (200, 204, 404):
-                response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise StorageBackendError(f"COS 删除失败: {e.response.status_code} {e.response.text}") from e
-        except httpx.RequestError as e:
+            async with session.delete(url, headers=headers) as response:
+                # 404 也算成功（文件本来就不存在）
+                if response.status not in (200, 204, 404):
+                    text = await response.text()
+                    raise StorageBackendError(f"COS 删除失败: {response.status} {text}")
+        except aiohttp.ClientError as e:
             raise StorageBackendError(f"COS 请求失败: {e}") from e
 
     async def get_file_url(
@@ -341,7 +340,7 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> bool:
         """检查文件是否存在。"""
-        client = self._ensure_client()
+        session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name)
 
         host = self._get_host(bucket)
@@ -354,11 +353,9 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("HEAD", path, params={}, headers=headers)
 
         try:
-            response = await client.head(url, headers=headers)
-            return response.status_code == 200
-        except httpx.HTTPStatusError:
-            return False
-        except httpx.RequestError:
+            async with session.head(url, headers=headers) as response:
+                return response.status == 200
+        except aiohttp.ClientError:
             return False
 
     async def download_file(
@@ -368,7 +365,7 @@ class COSStorage(IStorage):
         bucket_name: str | None = None,
     ) -> bytes:
         """下载文件。"""
-        client = self._ensure_client()
+        session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name)
 
         host = self._get_host(bucket)
@@ -381,16 +378,14 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("GET", path, params={}, headers=headers)
 
         try:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 404:
-                raise StorageNotFoundError(f"文件不存在: {object_name}")
-            response.raise_for_status()
-            return response.content
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise StorageNotFoundError(f"文件不存在: {object_name}") from e
-            raise StorageBackendError(f"COS 下载失败: {e.response.status_code} {e.response.text}") from e
-        except httpx.RequestError as e:
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    raise StorageNotFoundError(f"文件不存在: {object_name}")
+                if response.status >= 400:
+                    text = await response.text()
+                    raise StorageBackendError(f"COS 下载失败: {response.status} {text}")
+                return await response.read()
+        except aiohttp.ClientError as e:
             raise StorageBackendError(f"COS 请求失败: {e}") from e
 
     async def append_file(
@@ -414,7 +409,7 @@ class COSStorage(IStorage):
         Returns:
             下一次追加的位置
         """
-        client = self._ensure_client()
+        session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name)
 
         # 如果没有指定 position，先获取当前文件大小
@@ -440,22 +435,21 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("POST", path, params=params, headers=headers)
 
         try:
-            response = await client.post(url, content=data, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise StorageBackendError(f"COS 追加失败: {e.response.status_code} {e.response.text}") from e
-        except httpx.RequestError as e:
+            async with session.post(url, data=data, headers=headers) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise StorageBackendError(f"COS 追加失败: {response.status} {text}")
+                # 返回下一次追加的位置
+                next_position = response.headers.get("x-cos-next-append-position")
+                if next_position:
+                    return int(next_position)
+                return position + len(data)
+        except aiohttp.ClientError as e:
             raise StorageBackendError(f"COS 请求失败: {e}") from e
-
-        # 返回下一次追加的位置
-        next_position = response.headers.get("x-cos-next-append-position")
-        if next_position:
-            return int(next_position)
-        return position + len(data)
 
     async def _get_file_size(self, bucket: str, object_name: str) -> int:
         """获取文件大小，如果文件不存在返回 0。"""
-        client = self._ensure_client()
+        session = await self._ensure_session()
         host = self._get_host(bucket)
         path = "/" + object_name if not object_name.startswith("/") else object_name
         url = f"https://{host}{quote(path, safe='/-_.~')}"
@@ -466,19 +460,19 @@ class COSStorage(IStorage):
         headers["authorization"] = self._sign("HEAD", path, params={}, headers=headers)
 
         try:
-            response = await client.head(url, headers=headers)
-            if response.status_code == 200:
-                content_length = response.headers.get("content-length")
-                return int(content_length) if content_length else 0
-            return 0
-        except (httpx.HTTPStatusError, httpx.RequestError):
+            async with session.head(url, headers=headers) as response:
+                if response.status == 200:
+                    content_length = response.headers.get("content-length")
+                    return int(content_length) if content_length else 0
+                return 0
+        except aiohttp.ClientError:
             return 0
 
     async def close(self) -> None:
-        """关闭 httpx 客户端。"""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        """关闭 aiohttp 会话。"""
+        if self._session:
+            await self._session.close()
+            self._session = None
 
 
 __all__ = [
