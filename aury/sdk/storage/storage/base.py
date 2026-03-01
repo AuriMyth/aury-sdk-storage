@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import aiofiles
 from abc import ABC, abstractmethod
 from typing import BinaryIO
 
@@ -14,6 +15,16 @@ class IStorage(ABC):
 
     所有存储后端必须实现此接口。
     """
+
+    @abstractmethod
+    async def list_objects(
+        self,
+        prefix: str = "",
+        *,
+        bucket_name: str | None = None,
+    ) -> list[str]:
+        """列出对象名（按 prefix 过滤）。"""
+        pass
 
     @abstractmethod
     async def upload_file(
@@ -163,6 +174,28 @@ class LocalStorage(IStorage):
         """获取文件完整路径。"""
         return os.path.join(self._base_path, bucket, object_name)
 
+    async def list_objects(
+        self,
+        prefix: str = "",
+        *,
+        bucket_name: str | None = None,
+    ) -> list[str]:
+        """列出对象名（相对于 bucket 根目录）。"""
+        bucket = bucket_name or "default"
+        bucket_root = os.path.join(self._base_path, bucket)
+        if not os.path.isdir(bucket_root):
+            return []
+
+        objects: list[str] = []
+        for root, _, files in os.walk(bucket_root):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                rel = os.path.relpath(file_path, bucket_root).replace(os.sep, "/")
+                if not prefix or rel.startswith(prefix):
+                    objects.append(rel)
+        objects.sort()
+        return objects
+
     def _read_file_data(self, file: StorageFile) -> bytes:
         """读取文件数据。"""
         if file.data is None:
@@ -187,8 +220,8 @@ class LocalStorage(IStorage):
 
         # 写入文件
         data = self._read_file_data(file)
-        with open(file_path, "wb") as f:
-            f.write(data)
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(data)
 
         return UploadResult(
             url=f"file://{file_path}",
@@ -255,8 +288,8 @@ class LocalStorage(IStorage):
         bucket = bucket_name or "default"
         file_path = self._get_file_path(bucket, object_name)
 
-        with open(file_path, "rb") as f:
-            return f.read()
+        async with aiofiles.open(file_path, "rb") as f:
+            return await f.read()
 
     async def append_file(
         self,
@@ -274,9 +307,9 @@ class LocalStorage(IStorage):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
         # 追加写入
-        with open(file_path, "ab") as f:
-            f.write(data)
-            return f.tell()
+        async with aiofiles.open(file_path, "ab") as f:
+            await f.write(data)
+            return await f.tell()
 
 
 __all__ = [

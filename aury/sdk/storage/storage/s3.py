@@ -116,6 +116,39 @@ class S3Storage(IStorage):
             # AWS S3
             return f"s3://{bucket}/{object_name}"
 
+    async def list_objects(
+        self,
+        prefix: str = "",
+        *,
+        bucket_name: str | None = None,
+    ) -> list[str]:
+        """列出对象名（按 prefix 过滤）。"""
+        bucket = self._get_bucket(bucket_name)
+        keys: list[str] = []
+        continuation_token: str | None = None
+
+        async with await self._get_client() as client:
+            while True:
+                kwargs: dict[str, Any] = {
+                    "Bucket": bucket,
+                    "Prefix": prefix,
+                    "MaxKeys": 1000,
+                }
+                if continuation_token:
+                    kwargs["ContinuationToken"] = continuation_token
+
+                resp = await client.list_objects_v2(**kwargs)
+                for obj in resp.get("Contents", []) or []:
+                    key = obj.get("Key")
+                    if key:
+                        keys.append(key)
+
+                if not resp.get("IsTruncated"):
+                    break
+                continuation_token = resp.get("NextContinuationToken")
+
+        return keys
+
     async def upload_file(
         self,
         file: StorageFile,

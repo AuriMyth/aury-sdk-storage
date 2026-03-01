@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import time
+import xml.etree.ElementTree as ET
 from urllib.parse import quote, urlencode
 
 import aiohttp
@@ -229,6 +230,72 @@ class COSStorage(IStorage):
         return f"https://{host}{encoded_path}?{auth}"
 
     # ==================== IStorage 接口实现 ====================
+
+    async def list_objects(
+        self,
+        prefix: str = "",
+        *,
+        bucket_name: str | None = None,
+    ) -> list[str]:
+        """列出对象名（按 prefix 过滤）。"""
+        session = await self._ensure_session()
+        bucket = self._get_bucket(bucket_name)
+        host = self._get_host(bucket)
+        path = "/"
+        params: dict[str, str] = {}
+        if prefix:
+            params["prefix"] = prefix
+        params["max-keys"] = "1000"
+
+        objects: list[str] = []
+        marker = ""
+
+        while True:
+            if marker:
+                params["marker"] = marker
+            elif "marker" in params:
+                params.pop("marker", None)
+
+            query = urlencode(params)
+            url = f"https://{host}/?{query}"
+            headers: dict[str, str] = {"host": host}
+            if self._config.session_token:
+                headers["x-cos-security-token"] = self._config.session_token
+            headers["authorization"] = self._sign("GET", path, params=params, headers=headers)
+
+            try:
+                async with session.get(url, headers=headers) as response:
+                    if response.status >= 400:
+                        text = await response.text()
+                        raise StorageBackendError(f"COS 列表失败: {response.status} {text}")
+                    xml_text = await response.text()
+            except aiohttp.ClientError as e:
+                raise StorageBackendError(f"COS 请求失败: {e}") from e
+
+            root = ET.fromstring(xml_text)
+            for item in root.iter():
+                tag = item.tag.rsplit("}", 1)[-1]
+                if tag == "Key" and item.text:
+                    objects.append(item.text)
+
+            is_truncated = any(
+                node.text and node.text.lower() == "true"
+                for node in root.iter()
+                if node.tag.rsplit("}", 1)[-1] == "IsTruncated"
+            )
+            next_marker = ""
+            for node in root.iter():
+                if node.tag.rsplit("}", 1)[-1] == "NextMarker" and node.text:
+                    next_marker = node.text
+                    break
+
+            if not is_truncated:
+                break
+            marker = next_marker or (objects[-1] if objects else "")
+            if not marker:
+                break
+
+        return objects
 
     async def upload_file(
         self,
