@@ -7,8 +7,9 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
-from .models import COSSTSConfig
+from .models import COSSTSConfig, OSSSTSConfig
 from .provider import ISTSProvider
+from .providers.aliyun import AliyunSTSProvider
 from .providers.tencent import TencentSTSProvider
 
 
@@ -38,10 +39,12 @@ class STSProviderFactory:
 
     _providers: ClassVar[dict[ProviderType, type[ISTSProvider]]] = {
         ProviderType.COS: TencentSTSProvider,
+        ProviderType.OSS: AliyunSTSProvider,
     }
 
     _config_classes: ClassVar[dict[ProviderType, type[BaseModel]]] = {
         ProviderType.COS: COSSTSConfig,
+        ProviderType.OSS: OSSSTSConfig,
     }
 
     @classmethod

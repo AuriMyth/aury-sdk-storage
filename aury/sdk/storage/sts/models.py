@@ -96,10 +96,38 @@ class COSSTSConfig(BaseModel):
 TencentSTSConfig = COSSTSConfig
 
 
+class OSSSTSConfig(BaseModel):
+    """OSS STS Provider 配置（阿里云）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    access_key_id: str = Field(..., description="AccessKeyId")
+    access_key_secret: str = Field(..., description="AccessKeySecret")
+    role_arn: str = Field(..., description="RAM RoleArn")
+    role_session_name: str = Field(default="storage-sdk", description="RoleSessionName")
+    external_id: str | None = Field(default=None, description="ExternalId")
+    region: str = Field(default="cn-hangzhou", description="默认 OSS 区域")
+    sts_endpoint: str = Field(default="https://sts.aliyuncs.com", description="STS API Endpoint")
+    endpoint_template: str = Field(
+        default="https://oss-{region}.aliyuncs.com",
+        description="OSS Endpoint 模板",
+    )
+
+    def get_endpoint(self, region: str | None = None) -> str:
+        """获取 OSS endpoint。"""
+        r = (region or self.region).removeprefix("oss-")
+        return self.endpoint_template.format(region=r)
+
+
+AliyunSTSConfig = OSSSTSConfig
+
+
 __all__ = [
     "ActionType",
     "STSRequest",
     "STSCredentials",
     "COSSTSConfig",
+    "OSSSTSConfig",
+    "AliyunSTSConfig",
     "TencentSTSConfig",  # 别名，兼容
 ]

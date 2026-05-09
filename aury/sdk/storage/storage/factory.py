@@ -112,8 +112,13 @@ class StorageFactory:
                         "  2. pip install 'aury-sdk-storage[aws]'  # S3 兼容模式"
                     )
 
-        elif config.backend in (StorageBackend.OSS, StorageBackend.AWS, StorageBackend.MINIO):
-            # OSS、AWS、MinIO 使用 S3 兼容实现
+        elif config.backend == StorageBackend.OSS:
+            from .oss import OSSStorage
+
+            return OSSStorage(config)
+
+        elif config.backend in (StorageBackend.AWS, StorageBackend.MINIO):
+            # AWS、MinIO 使用 S3 兼容实现
             try:
                 from .s3 import S3Storage
 

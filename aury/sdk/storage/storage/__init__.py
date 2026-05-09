@@ -16,11 +16,14 @@ try:
 except ImportError:
     COSStorage = None  # type: ignore[assignment, misc]
 
+from .oss import OSSStorage
+
 __all__ = [
     "IStorage",
     "LocalStorage",
     "S3Storage",
     "COSStorage",
+    "OSSStorage",
     "StorageBackend",
     "StorageConfig",
     "StorageFile",

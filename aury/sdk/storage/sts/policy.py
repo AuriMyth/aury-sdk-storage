@@ -122,12 +122,66 @@ class TencentPolicyBuilder(IPolicyBuilder):
         return json.dumps(policy, separators=(",", ":"))
 
 
-# 预留其他厂商的 PolicyBuilder
-# class AliyunPolicyBuilder(IPolicyBuilder): ...
+class AliyunPolicyBuilder(IPolicyBuilder):
+    """阿里云 RAM Policy 构建器。
+
+    资源格式: acs:oss:*:*:{bucket}/{path}*
+    """
+
+    def _get_actions(self, action_type: ActionType) -> list[str]:
+        """获取操作列表。"""
+        read_actions = [
+            "oss:GetObject",
+            "oss:GetObjectMeta",
+        ]
+        write_actions = [
+            "oss:PutObject",
+            "oss:PostObject",
+            "oss:AppendObject",
+            "oss:InitiateMultipartUpload",
+            "oss:UploadPart",
+            "oss:UploadPartCopy",
+            "oss:CompleteMultipartUpload",
+            "oss:AbortMultipartUpload",
+            "oss:ListParts",
+            "oss:DeleteObject",
+        ]
+
+        match action_type:
+            case ActionType.READ:
+                return read_actions
+            case ActionType.WRITE:
+                return write_actions
+            case ActionType.ALL:
+                return read_actions + write_actions
+
+    def _build_resource(self, bucket: str, path: str) -> str:
+        """构建资源 ARN。"""
+        resource_path = f"{path}*" if path else "*"
+        return f"acs:oss:*:*:{bucket}/{resource_path}"
+
+    def build(self, request: STSRequest, **kwargs: Any) -> str:
+        """构建阿里云 RAM Policy。"""
+        del kwargs
+        policy = {
+            "Version": "1",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": self._get_actions(request.action_type),
+                    "Resource": [self._build_resource(request.bucket, request.allow_path)],
+                }
+            ],
+        }
+
+        return json.dumps(policy, separators=(",", ":"))
+
+
 # class AWSPolicyBuilder(IPolicyBuilder): ...
 
 
 __all__ = [
+    "AliyunPolicyBuilder",
     "IPolicyBuilder",
     "TencentPolicyBuilder",
 ]
