@@ -2,12 +2,112 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import aiofiles
 from abc import ABC, abstractmethod
-from typing import BinaryIO
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 from .models import StorageFile, UploadResult
+
+_DEFAULT_STREAM_CHUNK_SIZE = 8 * 1024 * 1024
+
+
+async def _run_blocking_io[T](func: Callable[[], T]) -> T:
+    """Run blocking filesystem or stream work outside the event loop."""
+
+    return await asyncio.to_thread(func)
+
+
+def _coerce_payload_chunk(payload: Any) -> bytes:
+    if payload is None:
+        return b""
+    if isinstance(payload, str):
+        return payload.encode("utf-8")
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        return bytes(payload)
+    raise TypeError(
+        "StorageFile.data.read() returned unsupported type: "
+        f"{type(payload).__name__}"
+    )
+
+
+async def read_storage_file_data(file: StorageFile) -> bytes:
+    """Read StorageFile.data without blocking the event loop.
+
+    Cloud backends need bytes for their HTTP clients. When callers pass a
+    synchronous BinaryIO/BytesIO stream, read it in a worker thread so async
+    upload paths do not stall the server event loop.
+    """
+
+    data = file.data
+    if data is None:
+        return b""
+    if isinstance(data, bytes):
+        return data
+
+    return _coerce_payload_chunk(await _run_blocking_io(data.read))
+
+
+async def get_storage_file_data_size(file: StorageFile) -> int:
+    """Return byte size to upload without consuming stream data.
+
+    For stream inputs, the size is measured from the current position to EOF,
+    and the original position is restored. COS PUT Object requires a signed
+    ``content-length`` header, so non-seekable streams are rejected instead of
+    being buffered into memory.
+    """
+
+    data = file.data
+    if data is None:
+        return 0
+    if isinstance(data, bytes):
+        return len(data)
+    if not hasattr(data, "tell") or not hasattr(data, "seek"):
+        raise TypeError("StorageFile.data stream must be seekable to determine content length")
+    if hasattr(data, "seekable") and not data.seekable():
+        raise TypeError("StorageFile.data stream must be seekable to determine content length")
+
+    def _size() -> int:
+        try:
+            current = data.tell()
+            try:
+                data.seek(0, os.SEEK_END)
+                end = data.tell()
+                return max(0, int(end) - int(current))
+            finally:
+                data.seek(current, os.SEEK_SET)
+        except OSError as exc:
+            raise TypeError(
+                "StorageFile.data stream must be seekable to determine content length"
+            ) from exc
+
+    return await _run_blocking_io(_size)
+
+
+async def iter_storage_file_data_chunks(
+    file: StorageFile,
+    *,
+    chunk_size: int = _DEFAULT_STREAM_CHUNK_SIZE,
+) -> AsyncIterator[bytes]:
+    """Yield StorageFile.data in chunks without buffering the full object."""
+
+    data = file.data
+    if data is None:
+        return
+    if isinstance(data, bytes):
+        if data:
+            yield data
+        return
+
+    while True:
+        chunk = _coerce_payload_chunk(
+            await _run_blocking_io(lambda: data.read(chunk_size))
+        )
+        if not chunk:
+            break
+        yield chunk
 
 
 class IStorage(ABC):
@@ -183,27 +283,22 @@ class LocalStorage(IStorage):
         """列出对象名（相对于 bucket 根目录）。"""
         bucket = bucket_name or "default"
         bucket_root = os.path.join(self._base_path, bucket)
-        if not os.path.isdir(bucket_root):
-            return []
 
-        objects: list[str] = []
-        for root, _, files in os.walk(bucket_root):
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                rel = os.path.relpath(file_path, bucket_root).replace(os.sep, "/")
-                if not prefix or rel.startswith(prefix):
-                    objects.append(rel)
-        objects.sort()
-        return objects
+        def _list() -> list[str]:
+            if not os.path.isdir(bucket_root):
+                return []
 
-    def _read_file_data(self, file: StorageFile) -> bytes:
-        """读取文件数据。"""
-        if file.data is None:
-            return b""
-        if isinstance(file.data, bytes):
-            return file.data
-        # BinaryIO
-        return file.data.read()
+            objects: list[str] = []
+            for root, _, files in os.walk(bucket_root):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    rel = os.path.relpath(file_path, bucket_root).replace(os.sep, "/")
+                    if not prefix or rel.startswith(prefix):
+                        objects.append(rel)
+            objects.sort()
+            return objects
+
+        return await _run_blocking_io(_list)
 
     async def upload_file(
         self,
@@ -216,10 +311,12 @@ class LocalStorage(IStorage):
         file_path = self._get_file_path(bucket, file.object_name)
 
         # 确保目录存在
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        await _run_blocking_io(
+            lambda: os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        )
 
         # 写入文件
-        data = self._read_file_data(file)
+        data = await read_storage_file_data(file)
         async with aiofiles.open(file_path, "wb") as f:
             await f.write(data)
 
@@ -252,8 +349,11 @@ class LocalStorage(IStorage):
         bucket = bucket_name or "default"
         file_path = self._get_file_path(bucket, object_name)
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        def _delete() -> None:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        await _run_blocking_io(_delete)
 
     async def get_file_url(
         self,
@@ -276,7 +376,7 @@ class LocalStorage(IStorage):
         """检查文件是否存在。"""
         bucket = bucket_name or "default"
         file_path = self._get_file_path(bucket, object_name)
-        return os.path.exists(file_path)
+        return await _run_blocking_io(lambda: os.path.exists(file_path))
 
     async def download_file(
         self,
@@ -304,7 +404,9 @@ class LocalStorage(IStorage):
         file_path = self._get_file_path(bucket, object_name)
 
         # 确保目录存在
-        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        await _run_blocking_io(
+            lambda: os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        )
 
         # 追加写入
         async with aiofiles.open(file_path, "ab") as f:
@@ -313,6 +415,9 @@ class LocalStorage(IStorage):
 
 
 __all__ = [
+    "get_storage_file_data_size",
     "IStorage",
+    "iter_storage_file_data_chunks",
     "LocalStorage",
+    "read_storage_file_data",
 ]

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from io import BytesIO
-from typing import Annotated, Any, BinaryIO
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -26,9 +25,26 @@ class StorageFile(BaseModel):
 
     object_name: str = Field(..., description="对象名/路径")
     bucket_name: str | None = Field(default=None, description="桶名（可选，使用默认桶）")
-    data: BinaryIO | BytesIO | bytes | None = Field(default=None, description="文件数据")
+    data: Any | None = Field(default=None, description="文件数据")
     content_type: str | None = Field(default=None, description="MIME 类型")
     metadata: dict[str, str] | None = Field(default=None, description="元数据")
+
+    @field_validator("data")
+    @classmethod
+    def validate_data(cls, v: Any) -> Any:
+        """Accept bytes or binary file-like objects.
+
+        ``typing.BinaryIO`` is not reliably runtime-checkable by Pydantic, so
+        validate the capability we actually need here.
+        """
+
+        if v is None or isinstance(v, bytes):
+            return v
+        if isinstance(v, (bytearray, memoryview)):
+            return bytes(v)
+        if hasattr(v, "read"):
+            return v
+        raise ValueError("StorageFile.data must be bytes or a binary file-like object")
 
 
 class StorageConfig(BaseModel):

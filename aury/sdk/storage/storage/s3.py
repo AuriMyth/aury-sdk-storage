@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from aury.sdk.storage.exceptions import StorageBackendError
 
-from .base import IStorage
+from .base import IStorage, read_storage_file_data
 from .models import StorageConfig, StorageFile, UploadResult
 
 # 延迟导入 aioboto3（可选依赖）
@@ -92,14 +92,6 @@ class S3Storage(IStorage):
         await self._ensure_initialized()
         return self._session.client("s3", **self._get_client_kwargs())
 
-    def _read_file_data(self, file: StorageFile) -> bytes:
-        """读取文件数据。"""
-        if file.data is None:
-            return b""
-        if isinstance(file.data, bytes):
-            return file.data
-        return file.data.read()
-
     def _build_url(self, bucket: str, object_name: str) -> str:
         """构建对象 URL。"""
         if self._config.endpoint:
@@ -157,7 +149,7 @@ class S3Storage(IStorage):
     ) -> UploadResult:
         """上传文件。"""
         bucket = self._get_bucket(bucket_name or file.bucket_name)
-        data = self._read_file_data(file)
+        data = await read_storage_file_data(file)
 
         extra_args: dict[str, Any] = {}
         if file.content_type:

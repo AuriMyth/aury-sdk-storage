@@ -17,7 +17,7 @@ import aiohttp
 
 from aury.sdk.storage.exceptions import StorageBackendError, StorageNotFoundError
 
-from .base import IStorage
+from .base import IStorage, get_storage_file_data_size, iter_storage_file_data_chunks
 from .models import StorageConfig, StorageFile, UploadResult
 
 
@@ -40,7 +40,7 @@ class COSStorage(IStorage):
     async def _ensure_session(self) -> aiohttp.ClientSession:
         """确保 aiohttp 会话已创建。"""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=60.0)
+            timeout = aiohttp.ClientTimeout(total=None, connect=30.0, sock_read=300.0)
             self._session = aiohttp.ClientSession(timeout=timeout)
         return self._session
 
@@ -78,14 +78,6 @@ class COSStorage(IStorage):
         """获取基础 URL。"""
         host = self._get_host(bucket)
         return f"https://{host}"
-
-    def _read_file_data(self, file: StorageFile) -> bytes:
-        """读取文件数据。"""
-        if file.data is None:
-            return b""
-        if isinstance(file.data, bytes):
-            return file.data
-        return file.data.read()
 
     # ==================== COS 签名算法 ====================
 
@@ -306,7 +298,8 @@ class COSStorage(IStorage):
         """上传文件。"""
         session = await self._ensure_session()
         bucket = self._get_bucket(bucket_name or file.bucket_name)
-        data = self._read_file_data(file)
+        content_length = await get_storage_file_data_size(file)
+        data = file.data if isinstance(file.data, bytes) else iter_storage_file_data_chunks(file)
 
         host = self._get_host(bucket)
         path = "/" + file.object_name if not file.object_name.startswith("/") else file.object_name
@@ -315,7 +308,7 @@ class COSStorage(IStorage):
         # 构建请求头
         headers: dict[str, str] = {
             "host": host,
-            "content-length": str(len(data)),
+            "content-length": str(content_length),
         }
         if file.content_type:
             headers["content-type"] = file.content_type
