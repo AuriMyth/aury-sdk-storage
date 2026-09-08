@@ -24,6 +24,9 @@ uv add "aury-sdk-storage[cos]"
 uv add "aury-sdk-storage[aws]"
 ```
 
+`S3Storage` 的客户端和预签名 URL 使用 AWS Signature Version 4，支持 `path`、
+`virtual` 寻址和 STS 临时凭证。`StorageConfig` 当前不提供签名版本覆盖参数。
+
 ## 快速开始
 
 ### STS 临时凭证

@@ -82,7 +82,8 @@ class S3Storage(IStorage):
             style = "virtual"
 
         kwargs["config"] = BotoConfig(
-            s3={"addressing_style": style, "signature_version": "s3v4"}
+            signature_version="s3v4",
+            s3={"addressing_style": style},
         )
 
         return kwargs
